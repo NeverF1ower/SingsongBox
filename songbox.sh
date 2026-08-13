@@ -32,8 +32,8 @@ readonly SCRIPT_NAME="SingBox 万能工具箱"
 #───────────────────────────────────────────────────────────────────────────────
 # 脚本更新地址（可用环境变量 VLESS_SCRIPT_RAW_URL / VLESS_REPO_URL 临时覆盖）
 #───────────────────────────────────────────────────────────────────────────────
-SCRIPT_RAW_URL="${VLESS_SCRIPT_RAW_URL:-https://raw.githubusercontent.com/NeverF1ower/Singingbox/main/singing.sh}"
-REPO_URL="${VLESS_REPO_URL:-https://github.com/NeverF1ower/Singingbox}"
+SCRIPT_RAW_URL="${VLESS_SCRIPT_RAW_URL:-https://raw.githubusercontent.com/NeverF1ower/SingsongBox/main/songbox.sh}"
+REPO_URL="${VLESS_REPO_URL:-https://github.com/NeverF1ower/SingsongBox}"
 
 readonly CFG="/etc/vless-reality"
 readonly DB_FILE="$CFG/db.json"
