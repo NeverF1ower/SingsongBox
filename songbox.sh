@@ -9,7 +9,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
 fi
 
 #═══════════════════════════════════════════════════════════════════════════════
-#  SingBox 万能工具箱 v0.0.3 [Sing-box 统一内核]
+#  SingBox 万能工具箱 v0.0.4 [Sing-box 统一内核]
 #
 #  架构:
 #    • Sing-box 内核: 承载除 Snell 外的全部协议（TCP/TLS/QUIC 统一管理）
@@ -25,7 +25,7 @@ fi
 #  适配: Alpine / Debian / Ubuntu / CentOS
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="0.0.3"
+readonly VERSION="0.0.4"
 readonly AUTHOR="NeverF1ower"
 readonly SCRIPT_NAME="SingBox 万能工具箱"
 
@@ -4071,6 +4071,35 @@ _sb_direct_outbound() {  # tag ip_version
     fi
 }
 
+# 绑定本机某个 IP 出站的 tag
+# 同一个 IP 可能同时存在"严格"和"允许回落"两种规则，回落模式必须单独成 tag，
+# 否则后写入的那条会因 tag 重复被丢弃，用户以为设了却没生效
+_bind_tag_for() {
+    local ip="$1" iv="${2:-}"
+    case "$iv" in
+        prefer_ipv4|prefer_ipv6) echo "bind-${ip//[.:]/-}-fallback" ;;
+        *)                       echo "bind-${ip//[.:]/-}" ;;
+    esac
+}
+
+# _sb_bind_outbound <tag> <本机IP> [ip_version]
+# 关键：绑了 IPv6 源地址却让 sing-box 自由解析，目标若是 v4-only 站点会走
+# 默认路由回落到 IPv4，直接暴露本机 v4。所以默认强制 *_only，杜绝回落。
+_sb_bind_outbound() {
+    local tag="$1" ip="$2" iv="${3:-}" field ds
+    if [[ "$ip" == *:* ]]; then
+        field="inet6_bind_address"; ds="ipv6_only"
+    else
+        field="inet4_bind_address"; ds="ipv4_only"
+    fi
+    # 只有显式选了 prefer_* 才允许回落（会泄露另一族地址，UI 里已警告）
+    case "$iv" in
+        prefer_ipv4|prefer_ipv6) ds="$iv" ;;
+    esac
+    jq -nc --arg t "$tag" --arg f "$field" --arg ip "$ip" --arg d "$ds" \
+        '{type:"direct", tag:$t, domain_strategy:$d} | .[$f] = $ip'
+}
+
 _direct_tag_for() {  # ip_version -> outbound tag
     case "$1" in
         ipv4_only)   echo "direct-ipv4" ;;
@@ -4250,6 +4279,7 @@ _rule_outbound_tag() {  # outbound ip_version
         direct)     _direct_tag_for "$iv" ;;
         warp)       echo "warp" ;;
         block)      echo "__reject__" ;;
+        bind:*)     _bind_tag_for "${ob#bind:}" "$iv" ;;
         chain:*)    echo "chain-${ob#chain:}" ;;
         balancer:*) echo "balancer-${ob#balancer:}" ;;
         *)          echo "$ob" ;;
@@ -4396,6 +4426,21 @@ generate_singbox_config() {
             outbounds=$(jq -nc --argjson a "$outbounds" --argjson o "$(_sb_direct_outbound "$dt" "$iv")" '$a + [$o]')
         fi
     done < <(db_routing_rules | jq -r '.[] | select(.outbound == "direct") | .ip_version // "as_is"' | sort -u)
+
+    # 绑定本机指定 IP 的出站（bind:<ip>）
+    local bip bt biv
+    while IFS='|' read -r bip biv; do
+        [[ -z "$bip" ]] && continue
+        bt=$(_bind_tag_for "$bip" "$biv")
+        echo "$outbounds" | jq -e --arg t "$bt" 'any(.[]; .tag == $t)' >/dev/null && continue
+        # 本机确实还持有这个地址才生成，否则 sing-box 会因 bind 失败而整体起不来
+        if ! { get_all_public_ipv4; get_all_public_ipv6; } 2>/dev/null | grep -qxF "$bip"; then
+            _warn "出口绑定 IP ${bip} 已不在本机，相关规则将被跳过"
+            continue
+        fi
+        outbounds=$(jq -nc --argjson a "$outbounds" \
+            --argjson o "$(_sb_bind_outbound "$bt" "$bip" "$biv")" '$a + [$o]')
+    done < <(db_routing_rules | jq -r '.[] | select(.outbound | startswith("bind:")) | "\(.outbound | ltrimstr("bind:"))|\(.ip_version // "")"' | sort -u)
 
     # 全局直连出口 IP 版本（作用于默认 direct）
     local gdiv; gdiv=$(db_get_direct_ip_version)
@@ -5225,425 +5270,6 @@ test_warp_connection() {
     esac
     echo -e "  直连出口: ${C}$(get_ipv4)${NC}" >&2
     _line
-}
-#═══════════════════════════════════════════════════════════════════════════════
-# Realm 端口转发
-#═══════════════════════════════════════════════════════════════════════════════
-# realm 是一个纯转发工具（TCP/UDP relay），与代理协议无关：
-# 中转机监听一个端口，把流量原样丢给落地机，不解密、不改包。
-# 常见用法：国内中转机 → 海外落地机的代理端口。
-readonly REALM_BIN="/usr/local/bin/realm"
-readonly REALM_CONF="$CFG/realm.toml"
-readonly REALM_SVC="vless-realm"
-
-_realm_installed() { [[ -x "$REALM_BIN" ]]; }
-_realm_version() { _realm_installed && "$REALM_BIN" --version 2>/dev/null | awk '{print $2}'; }
-
-# realm 的资产命名：realm-<triple>.tar.gz，musl 版静态链接、兼容性最好
-_realm_asset() {
-    case "$(uname -m)" in
-        x86_64|amd64)   echo "realm-x86_64-unknown-linux-musl.tar.gz" ;;
-        aarch64|arm64)  echo "realm-aarch64-unknown-linux-musl.tar.gz" ;;
-        armv7l)         echo "realm-armv7-unknown-linux-musleabihf.tar.gz" ;;
-        *) return 1 ;;
-    esac
-}
-
-install_realm() {
-    local force="${1:-false}" asset tag url tmp ok=false
-    asset=$(_realm_asset) || { _err "不支持的 CPU 架构: $(uname -m)"; return 1; }
-
-    if _realm_installed && [[ "$force" != "true" ]]; then
-        _ok "realm 已安装 (v$(_realm_version))"
-        return 0
-    fi
-
-    tag=$(_gh_latest_tag "zhboner/realm") || tag=""
-    if [[ -z "$tag" ]]; then
-        # API 不可达时从 releases/latest 的跳转里取 tag
-        tag=$(curl -sIL --connect-timeout 10 --max-time 20 \
-              "https://github.com/zhboner/realm/releases/latest" 2>/dev/null |
-              awk '/^[Ll]ocation:/{print $2}' | tail -1 | tr -d '\r')
-        tag="${tag##*/}"
-    fi
-    [[ -z "$tag" ]] && { _err "无法获取 realm 最新版本号"; return 1; }
-    _info "安装 realm ${tag} (${asset})"
-
-    tmp=$(mktemp -d) || return 1
-    for url in \
-        "https://github.com/zhboner/realm/releases/download/${tag}/${asset}" \
-        "https://gh-proxy.com/https://github.com/zhboner/realm/releases/download/${tag}/${asset}"; do
-        if curl -fsSL --connect-timeout 12 --max-time 180 -o "$tmp/r.tar.gz" "$url" 2>/dev/null &&
-           [[ -s "$tmp/r.tar.gz" ]] && tar -tzf "$tmp/r.tar.gz" >/dev/null 2>&1; then
-            ok=true; break
-        fi
-        _warn "该地址不可用，尝试镜像"
-    done
-    [[ "$ok" != "true" ]] && { rm -rf "$tmp"; _err "realm 下载失败"; return 1; }
-
-    tar -xzf "$tmp/r.tar.gz" -C "$tmp" || { rm -rf "$tmp"; _err "解包失败"; return 1; }
-    local bin; bin=$(find "$tmp" -type f -name realm | head -1)
-    [[ -z "$bin" ]] && { rm -rf "$tmp"; _err "压缩包内未找到 realm 可执行文件"; return 1; }
-    chmod +x "$bin"
-    if ! "$bin" --version >/dev/null 2>&1; then
-        rm -rf "$tmp"; _err "下载的 realm 无法执行（架构不匹配?）"; return 1
-    fi
-    install -m 755 "$bin" "$REALM_BIN"
-    rm -rf "$tmp"
-    _ok "realm 安装完成: v$(_realm_version)"
-}
-
-#── 规则存储（放在 db.json 里，备份/恢复自动覆盖）──────────────────────────────
-realm_rules()      { _db_q -c '(.realm.rules // [])[]'; }
-realm_rules_json() { _db_q -c '.realm.rules // []'; }
-realm_count()      { _db_q '(.realm.rules // []) | length'; }
-realm_rule_by_id() { _db_q -c --arg i "$1" '[(.realm.rules // [])[] | select(.id == $i)][0] // empty'; }
-realm_id_exists()  { [[ -n "$(realm_rule_by_id "$1")" ]]; }
-realm_listen_used() { _db_q --arg p "$1" '[(.realm.rules // [])[] | select((.listen_port|tostring) == $p)] | length'; }
-
-realm_add_rule() {
-    local json="$1"
-    echo "$json" | jq empty 2>/dev/null || return 1
-    _db_apply --argjson r "$json" '
-        ($r.id) as $rid
-        | .realm = ((.realm // {enabled:true, rules:[]}))
-        | .realm.rules = ([((.realm.rules // [])[] | select(.id != $rid))] + [$r])'
-}
-realm_del_rule() {
-    _db_apply --arg i "$1" '.realm.rules = ((.realm.rules // []) | map(select(.id != $i)))'
-}
-
-#── 配置生成 ───────────────────────────────────────────────────────────────────
-# realm 2.x TOML：全局 [network] + 每条 [[endpoints]]，
-# 单条可用 [endpoints.network] 覆盖协议（实测 2.9.4 支持）
-generate_realm_config() {
-    local n; n=$(realm_count)
-    if [[ "${n:-0}" -eq 0 ]]; then
-        rm -f "$REALM_CONF"
-        return 1
-    fi
-    # 监听地址跟随本机双栈能力：纯 IPv4 机器上绑 [::] 会导致 UDP worker 直接 panic
-    local lhost; lhost=$(_listen_addr)
-    local tmp; tmp=$(mktemp) || return 1
-    {
-        echo "# 由 ${SCRIPT_NAME} 生成 - $(date '+%F %T')"
-        echo "[log]"
-        echo 'level = "warn"'
-        echo 'output = "stdout"'
-        echo ""
-        echo "[network]"
-        echo "no_tcp = false"
-        echo "use_udp = true"
-        echo "zero_copy = true"
-        echo "tcp_timeout = 300"
-        echo "udp_timeout = 30"
-        echo ""
-        local rule name lp rh rp proto through
-        while IFS= read -r rule; do
-            [[ -z "$rule" ]] && continue
-            name=$(echo "$rule"  | jq -r '.name')
-            lp=$(echo "$rule"    | jq -r '.listen_port')
-            rh=$(echo "$rule"    | jq -r '.remote_host')
-            rp=$(echo "$rule"    | jq -r '.remote_port')
-            proto=$(echo "$rule" | jq -r '.protocol // "both"')
-            through=$(echo "$rule" | jq -r '.through // empty')
-            echo "# ${name}"
-            echo "[[endpoints]]"
-            # 双栈机器绑 [::]（一个套接字同时收 v4/v6），纯 v4 机器绑 0.0.0.0
-            echo "listen = \"$(_fmt_hostport "$lhost" "$lp")\""
-            if [[ "$rh" == *:* && "$rh" != \[* ]]; then
-                echo "remote = \"[${rh}]:${rp}\""
-            else
-                echo "remote = \"${rh}:${rp}\""
-            fi
-            [[ -n "$through" ]] && echo "through = \"${through}\""
-            case "$proto" in
-                tcp) echo "[endpoints.network]"; echo "no_tcp = false"; echo "use_udp = false" ;;
-                udp) echo "[endpoints.network]"; echo "no_tcp = true";  echo "use_udp = true" ;;
-            esac
-            echo ""
-        done < <(realm_rules)
-    } >"$tmp"
-
-    if ! "$REALM_BIN" -c "$tmp" --version >/dev/null 2>&1; then :; fi
-    install -m 600 "$tmp" "$REALM_CONF"
-    rm -f "$tmp"
-    return 0
-}
-
-create_realm_service() {
-    local exec="${REALM_BIN} -c ${REALM_CONF}"
-    if [[ "$DISTRO" == "alpine" ]]; then
-        _write_openrc "$REALM_SVC" "Realm Port Forwarder" "$REALM_BIN" "-c $REALM_CONF"
-    else
-        _write_systemd "$REALM_SVC" "Realm Port Forwarder" "$exec"
-    fi
-}
-
-realm_apply() {
-    if ! generate_realm_config; then
-        svc stop "$REALM_SVC" 2>/dev/null
-        svc disable "$REALM_SVC" 2>/dev/null
-        _info "没有转发规则，realm 服务已停止"
-        return 0
-    fi
-    create_realm_service
-    svc enable "$REALM_SVC" >/dev/null 2>&1
-    if svc status "$REALM_SVC" >/dev/null 2>&1; then
-        svc restart "$REALM_SVC" >/dev/null 2>&1
-    else
-        svc start "$REALM_SVC" >/dev/null 2>&1
-    fi
-    sleep 1
-    if svc status "$REALM_SVC" >/dev/null 2>&1; then
-        _ok "realm 运行中（$(realm_count) 条转发规则）"
-    else
-        _err "realm 启动失败"
-        echo -e "  ${D}手动排查: ${REALM_BIN} -c ${REALM_CONF}${NC}" >&2
-        return 1
-    fi
-}
-
-#── 交互 ───────────────────────────────────────────────────────────────────────
-realm_show_rules() {
-    local n; n=$(realm_count)
-    _line
-    echo -e "  ${W}转发规则${NC} ${D}(共 ${n:-0} 条)${NC}" >&2
-    _line
-    if [[ "${n:-0}" -eq 0 ]]; then
-        echo -e "  ${D}暂无规则${NC}" >&2; _line; return 1
-    fi
-    local ip4; ip4=$(get_ipv4)
-    printf "  ${W}%-3s %-14s %-9s %-30s %-6s${NC}\n" "#" "名称" "本机端口" "转发到" "协议" >&2
-    local i=1 rule
-    while IFS= read -r rule; do
-        [[ -z "$rule" ]] && continue
-        printf "  %-3s %-14s %-9s %-30s %-6s\n" \
-            "$i" \
-            "$(echo "$rule" | jq -r '.name')" \
-            "$(echo "$rule" | jq -r '.listen_port')" \
-            "$(echo "$rule" | jq -r '"\(.remote_host):\(.remote_port)"')" \
-            "$(echo "$rule" | jq -r '.protocol // "both"')" >&2
-        ((i++))
-    done < <(realm_rules)
-    _line
-    [[ -n "$ip4" ]] && echo -e "  ${D}客户端连本机 ${ip4}:<本机端口> 即等同于连落地机${NC}" >&2
-    return 0
-}
-
-realm_add_interactive() {
-    echo "" >&2
-    _line
-    echo -e "  ${W}添加转发规则${NC}" >&2
-    echo -e "  ${D}本机监听一个端口，收到的流量原样转给落地机，不解密不改包${NC}" >&2
-    _line
-    local name lp rh rp proto through=""
-
-    while true; do
-        read -rp "  规则名称 (仅字母数字与-_): " name
-        [[ -z "$name" ]] && { _err "不能为空"; continue; }
-        [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || { _err "含非法字符"; continue; }
-        realm_id_exists "$name" && { _err "名称已存在"; continue; }
-        break
-    done
-
-    local owner
-    while true; do
-        read -rp "  本机监听端口: " lp
-        _is_valid_port "$lp" || { _err "端口必须为 1-65535"; continue; }
-        if [[ "$(realm_listen_used "$lp")" != "0" ]]; then _err "该端口已被其它转发规则占用"; continue; fi
-        owner=$(is_internal_port_occupied "$lp") && { _err "端口被本脚本的 [${owner}] 占用"; continue; }
-        if _port_listening "$lp"; then
-            _warn "端口 ${lp} 已有进程监听"
-            _ask_yes "仍要使用?" || continue
-        fi
-        break
-    done
-
-    while true; do
-        read -rp "  落地机地址 (IP 或域名): " rh
-        rh=$(echo "$rh" | tr -d '[:space:]' | tr -d '[]')
-        [[ -z "$rh" ]] && { _err "不能为空"; continue; }
-        _is_valid_host "$rh" && break
-        _err "地址格式无效"
-    done
-    while true; do
-        read -rp "  落地机端口: " rp
-        _is_valid_port "$rp" && break
-        _err "端口必须为 1-65535"
-    done
-
-    echo "" >&2
-    _item "1" "TCP + UDP ${D}(默认，Hysteria2/TUIC 等 UDP 协议必须选这个)${NC}"
-    _item "2" "仅 TCP"
-    _item "3" "仅 UDP"
-    local pc; read -rp "  协议 [1]: " pc
-    case "${pc:-1}" in 2) proto="tcp" ;; 3) proto="udp" ;; *) proto="both" ;; esac
-
-    if _ask_yes "指定出站源地址 (多 IP 机器上绑定特定出口)?"; then
-        read -rp "  出站绑定地址: " through
-        through=$(echo "$through" | tr -d '[:space:]')
-        [[ -n "$through" ]] && ! _is_valid_host "$through" && { _warn "地址无效，已忽略"; through=""; }
-    fi
-
-    echo "" >&2
-    _line
-    echo -e "  名称: ${G}${name}${NC}" >&2
-    echo -e "  转发: ${G}本机:${lp}${NC} → ${G}${rh}:${rp}${NC}   协议: ${G}${proto}${NC}" >&2
-    [[ -n "$through" ]] && echo -e "  出站绑定: ${G}${through}${NC}" >&2
-    _line
-    _ask_yes "确认添加?" || return 0
-
-    local json
-    json=$(jq -nc --arg id "$name" --arg n "$name" --argjson lp "$lp" \
-        --arg rh "$rh" --argjson rp "$rp" --arg pr "$proto" --arg th "$through" \
-        '{id:$id, name:$n, listen_port:$lp, remote_host:$rh, remote_port:$rp,
-          protocol:$pr, through:$th, created:(now|todate)}')
-    realm_add_rule "$json" || { _err "写入失败"; return 1; }
-
-    case "$proto" in
-        tcp)  allow_port "$lp" tcp ;;
-        udp)  allow_port "$lp" udp ;;
-        *)    allow_port_both "$lp" ;;
-    esac
-    realm_apply
-    echo "" >&2
-    _ok "已添加。客户端把服务器地址改成 $(get_ipv4):${lp} 即可"
-    [[ "$proto" != "tcp" ]] && _warn "UDP 转发请确认云安全组已放行 ${lp}/udp"
-}
-
-realm_del_interactive() {
-    realm_show_rules || return
-    local ids=() rule i=1
-    while IFS= read -r rule; do
-        [[ -z "$rule" ]] && continue
-        ids+=("$(echo "$rule" | jq -r '.id')")
-    done < <(realm_rules)
-    echo "" >&2
-    local ch; read -rp "  要删除的规则编号 (0 取消): " ch
-    [[ "$ch" == "0" || -z "$ch" ]] && return
-    [[ "$ch" =~ ^[0-9]+$ ]] && (( ch >= 1 && ch <= ${#ids[@]} )) || { _err "无效选择"; return; }
-    local id="${ids[$((ch-1))]}"
-    _ask_yes "确认删除 ${id}?" || return
-    realm_del_rule "$id"
-    realm_apply
-    _ok "已删除 ${id}"
-}
-
-realm_test_rule() {
-    realm_show_rules || return
-    local ids=() rule
-    while IFS= read -r rule; do
-        [[ -z "$rule" ]] && continue
-        ids+=("$(echo "$rule" | jq -r '.id')")
-    done < <(realm_rules)
-    echo "" >&2
-    local ch; read -rp "  要测试的规则编号 (0 取消): " ch
-    [[ "$ch" == "0" || -z "$ch" ]] && return
-    [[ "$ch" =~ ^[0-9]+$ ]] && (( ch >= 1 && ch <= ${#ids[@]} )) || { _err "无效选择"; return; }
-    local r; r=$(realm_rule_by_id "${ids[$((ch-1))]}")
-    local lp rh rp
-    lp=$(echo "$r" | jq -r '.listen_port'); rh=$(echo "$r" | jq -r '.remote_host'); rp=$(echo "$r" | jq -r '.remote_port')
-
-    _line
-    echo -e "  ${W}连通性检查${NC}" >&2
-    if _port_listening "$lp"; then
-        _ok "本机 ${lp} 端口有监听"
-    else
-        _err "本机 ${lp} 端口无监听（realm 可能没起来）"
-    fi
-    _info "测试到落地机 ${rh}:${rp} 的 TCP 连通性..."
-    if timeout 8 bash -c "exec 3<>/dev/tcp/${rh}/${rp}" 2>/dev/null; then
-        _ok "落地机 ${rh}:${rp} TCP 可达"
-    else
-        _err "落地机 ${rh}:${rp} TCP 不可达"
-        echo -e "  ${D}检查落地机是否在监听、其防火墙/安全组是否放行了中转机 IP${NC}" >&2
-        echo -e "  ${D}（若落地协议是纯 UDP，如 Hysteria2/TUIC，TCP 探测失败属正常）${NC}" >&2
-    fi
-    _line
-}
-
-uninstall_realm() {
-    _ask_yes "卸载 realm（会删除全部转发规则）?" || return
-    svc stop "$REALM_SVC" 2>/dev/null
-    svc disable "$REALM_SVC" 2>/dev/null
-    if [[ "$DISTRO" == "alpine" ]]; then rm -f "/etc/init.d/${REALM_SVC}"
-    else rm -f "/etc/systemd/system/${REALM_SVC}.service"; systemctl daemon-reload 2>/dev/null; fi
-    rm -f "$REALM_CONF"
-    _db_apply 'del(.realm)'
-    _ask_yes "同时删除 ${REALM_BIN} 二进制?" && rm -f "$REALM_BIN"
-    _ok "realm 已卸载"
-}
-
-manage_realm() {
-    while true; do
-        _header
-        echo -e "  ${W}Realm 端口转发${NC}" >&2
-        _line
-        if _realm_installed; then
-            echo -e "  版本: ${G}v$(_realm_version)${NC}" >&2
-            if svc status "$REALM_SVC" >/dev/null 2>&1; then
-                echo -e "  状态: ${G}● 运行中${NC}   规则: ${G}$(realm_count)${NC} 条" >&2
-            else
-                echo -e "  状态: ${R}● 未运行${NC}   规则: ${C}$(realm_count)${NC} 条" >&2
-            fi
-        else
-            echo -e "  状态: ${D}未安装${NC}" >&2
-        fi
-        _line
-        echo -e "  ${D}用途: 本机做中转，把端口流量原样转发到落地机；不解密、不改包${NC}" >&2
-        _line
-        if _realm_installed; then
-            _item "1" "查看转发规则"
-            _item "2" "添加转发规则"
-            _item "3" "删除转发规则"
-            _item "4" "测试规则连通性"
-            echo -e "  ${D}───────────────────────────────────────────${NC}" >&2
-            _item "5" "重启 realm"
-            _item "6" "停止 realm"
-            _item "7" "查看运行日志"
-            _item "8" "查看生成的配置"
-            _item "9" "更新 realm 到最新版"
-            _item "u" "卸载 realm"
-        else
-            _item "1" "安装 realm"
-        fi
-        _item "0" "返回"
-        _line
-        local ch; read -rp "  请选择: " ch
-        if ! _realm_installed; then
-            case "$ch" in
-                1) install_realm && { _ask_yes "现在添加第一条转发规则?" && realm_add_interactive; }; _pause ;;
-                0) return ;;
-                *) _err "无效选择"; sleep 1 ;;
-            esac
-            continue
-        fi
-        case "$ch" in
-            1) realm_show_rules; _pause ;;
-            2) realm_add_interactive; _pause ;;
-            3) realm_del_interactive; _pause ;;
-            4) realm_test_rule; _pause ;;
-            5) realm_apply; _pause ;;
-            6) svc stop "$REALM_SVC" && _ok "已停止"; _pause ;;
-            7)
-                _line
-                if [[ "$DISTRO" == "alpine" ]]; then
-                    grep -i realm /var/log/messages 2>/dev/null | tail -40 >&2 || _warn "无日志"
-                else
-                    journalctl -u "$REALM_SVC" --no-pager -n 40 >&2 2>/dev/null || _warn "无日志"
-                fi
-                _pause ;;
-            8)
-                _line
-                [[ -f "$REALM_CONF" ]] && sed 's/^/    /' "$REALM_CONF" >&2 || _warn "配置不存在"
-                _line; _pause ;;
-            9) install_realm true && realm_apply; _pause ;;
-            u|U) uninstall_realm; _pause ;;
-            0) return ;;
-            *) _err "无效选择"; sleep 1 ;;
-        esac
-    done
 }
 #═══════════════════════════════════════════════════════════════════════════════
 # 分享链接生成
@@ -6741,6 +6367,7 @@ _outbound_display() {
         direct) echo "直连" ;;
         warp) echo "WARP" ;;
         block) echo "拦截" ;;
+        bind:*) echo "出口IP→${1#bind:}" ;;
         chain:*) echo "节点→${1#chain:}" ;;
         balancer:*) echo "负载→${1#balancer:}" ;;
         *) echo "$1" ;;
@@ -6772,6 +6399,13 @@ _select_outbound() {
         echo -e "  ${G}$i${NC}) 负载均衡: $n ${D}($(echo "$g" | jq -r '.strategy'), $(echo "$g" | jq -r '.nodes|length') 节点)${NC}" >&2
         opts+=("balancer:$n"); ((i++))
     done < <(db_balancer_groups | jq -r '.[].name')
+    # 本机多 IP 时提供绑定出口选项
+    local lip
+    while IFS= read -r lip; do
+        [[ -z "$lip" ]] && continue
+        echo -e "  ${G}$i${NC}) 绑定本机 IP ${C}${lip}${NC} ${D}(严格同族，不回落)${NC}" >&2
+        opts+=("bind:$lip"); ((i++))
+    done < <( { get_all_public_ipv4; get_all_public_ipv6; } 2>/dev/null | sed '/^$/d' )
     if [[ "$allow_block" == "true" ]]; then
         echo -e "  ${G}$i${NC}) 拦截 (block)" >&2; opts+=("block"); ((i++))
     fi
@@ -7103,31 +6737,297 @@ manage_ip_routing() {
 #═══════════════════════════════════════════════════════════════════════════════
 # 直连出口设置
 #═══════════════════════════════════════════════════════════════════════════════
-configure_direct_outbound() {
+#═══════════════════════════════════════════════════════════════════════════════
+# 本机 IP 分析与出口绑定
+#═══════════════════════════════════════════════════════════════════════════════
+# 逐个 IP 查地域（同一台机器的多个 IPv6 很可能落在不同段/不同归属）
+# 结果缓存到 $CFG/ip_geo.cache，避免每次进菜单都打 API
+_ip_geo_cached() {
+    local ip="$1" cache="$CFG/ip_geo.cache" line geo
+    if [[ -f "$cache" ]]; then
+        line=$(grep -m1 "^${ip}|" "$cache" 2>/dev/null) && { echo "${line#*|}"; return 0; }
+    fi
+    geo=$(curl -sf --connect-timeout 5 --max-time 8 "https://ipinfo.io/${ip}/json" 2>/dev/null |
+          jq -r '[(.country // "XX"), (.city // ""), (.org // "")] | join("/")' 2>/dev/null)
+    [[ -z "$geo" || "$geo" == "null" ]] && geo="XX//"
+    mkdir -p "$CFG"
+    printf '%s|%s\n' "$ip" "$geo" >>"$cache"
+    echo "$geo"
+}
+
+# 本机默认出口 IP（不指定源地址时实际会用哪个）
+_default_egress_ip() {
+    local fam="${1:-4}" ip
+    if [[ "$fam" == "6" ]]; then
+        ip=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | grep -oE 'src [0-9a-f:]+' | awk '{print $2}')
+    else
+        ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')
+    fi
+    echo "$ip"
+}
+
+# 收集本机所有公网 IP 到 LOCAL_IPS 数组
+_collect_local_ips() {
+    LOCAL_IPS=()
+    local ip
+    while IFS= read -r ip; do [[ -n "$ip" ]] && LOCAL_IPS+=("$ip"); done < <(get_all_public_ipv4)
+    while IFS= read -r ip; do [[ -n "$ip" ]] && LOCAL_IPS+=("$ip"); done < <(get_all_public_ipv6)
+    [[ ${#LOCAL_IPS[@]} -gt 0 ]]
+}
+
+analyze_local_ips() {
+    _line
+    echo -e "  ${W}本机 IP 与地域分析${NC}" >&2
+    _line
+    if ! _collect_local_ips; then
+        _err "未检测到公网 IP（需要 iproute2）"; _line; return 1
+    fi
+    local d4 d6; d4=$(_default_egress_ip 4); d6=$(_default_egress_ip 6)
+    _info "查询各 IP 归属（首次较慢，结果会缓存）..."
+    printf "  ${W}%-3s %-40s %-10s %-24s %s${NC}\n" "#" "地址" "族" "归属" "默认出口" >&2
+    local i=1 ip geo cc org mark fam
+    for ip in "${LOCAL_IPS[@]}"; do
+        geo=$(_ip_geo_cached "$ip")
+        cc="${geo%%/*}"; org=$(echo "$geo" | cut -d/ -f3 | cut -c1-22)
+        [[ "$ip" == *:* ]] && fam="IPv6" || fam="IPv4"
+        mark=""
+        [[ "$ip" == "$d4" || "$ip" == "$d6" ]] && mark="${G}← 默认${NC}"
+        printf "  %-3s %-40s %-10s %-24s %b\n" "$i" "$ip" "$fam" "${cc} $(_flag_emoji "$cc")" "$mark" >&2
+        [[ -n "$org" ]] && echo -e "      ${D}${org}${NC}" >&2
+        ((i++))
+    done
+    _line
+    echo -e "  ${D}默认出口: IPv4=${d4:-无}  IPv6=${d6:-无}${NC}" >&2
+    echo -e "  ${D}不绑定源地址时，出站就走上面这两个；绑定后才会用指定地址${NC}" >&2
+    _line
+}
+
+# 选一个本机 IP，回显到 stdout
+_pick_local_ip() {
+    local want="${1:-any}"   # any | v4 | v6
+    _collect_local_ips || { _err "未检测到公网 IP"; return 1; }
+    local list=() ip
+    for ip in "${LOCAL_IPS[@]}"; do
+        case "$want" in
+            v4) [[ "$ip" == *:* ]] && continue ;;
+            v6) [[ "$ip" != *:* ]] && continue ;;
+        esac
+        list+=("$ip")
+    done
+    [[ ${#list[@]} -eq 0 ]] && { _err "没有符合条件的地址"; return 1; }
+    local i=1 geo
+    for ip in "${list[@]}"; do
+        geo=$(_ip_geo_cached "$ip")
+        _item "$i" "${ip} ${D}(${geo%%/*})${NC}"
+        ((i++))
+    done
+    _item "0" "取消"
+    _line
+    local ch; read -rp "  选择 IP: " ch
+    [[ "$ch" == "0" || -z "$ch" ]] && return 1
+    [[ "$ch" =~ ^[0-9]+$ ]] && (( ch >= 1 && ch <= ${#list[@]} )) || { _err "无效选择"; return 1; }
+    echo "${list[$((ch-1))]}"
+}
+
+# 按规则集把出口绑到某个本机 IP
+bind_egress_by_ruleset() {
     _header
-    echo -e "  ${W}直连出口设置${NC}" >&2
+    echo -e "  ${W}按规则集绑定出口 IP${NC}" >&2
+    analyze_local_ips || { _pause; return; }
+    echo "" >&2
+    echo -e "  ${D}下面选中的流量将以指定本机 IP 作为源地址出站${NC}" >&2
+
+    local ip; ip=$(_pick_local_ip any) || return
+    local fam="IPv4"; [[ "$ip" == *:* ]] && fam="IPv6"
+
+    # 防泄露策略
+    echo "" >&2
     _line
-    echo -e "  ${D}控制直连(direct)出站解析/使用的 IP 版本，适用于双栈服务器${NC}" >&2
-    echo -e "  当前设置: ${G}$(db_get_direct_ip_version)${NC}" >&2
+    echo -e "  ${W}回落策略（防泄露）${NC}" >&2
+    echo -e "  ${D}绑定 ${fam} 出口后，若目标站点只有另一族地址会发生什么：${NC}" >&2
     _line
-    _item "1" "AsIs ${D}(默认，不做处理)${NC}"
-    _item "2" "优先 IPv4"
-    _item "3" "优先 IPv6"
-    _item "4" "仅 IPv4"
-    _item "5" "仅 IPv6"
+    if [[ "$ip" == *:* ]]; then
+        _item "1" "严格 IPv6 ${D}(推荐；v4-only 站点直接失败，绝不泄露 IPv4)${NC}"
+        _item "2" "优先 IPv6，允许回落 ${R}(v4-only 站点会暴露本机 IPv4)${NC}"
+    else
+        _item "1" "严格 IPv4 ${D}(推荐)${NC}"
+        _item "2" "优先 IPv4，允许回落 ${R}(会暴露本机 IPv6)${NC}"
+    fi
+    _line
+    local pc iv=""; read -rp "  请选择 [1]: " pc
+    if [[ "${pc:-1}" == "2" ]]; then
+        [[ "$ip" == *:* ]] && iv="prefer_ipv6" || iv="prefer_ipv4"
+        _warn "已选择允许回落：目标只有另一族地址时会暴露另一个本机 IP"
+    fi
+
+    # 选规则集
+    echo "" >&2
+    _line
+    echo -e "  ${W}选择要走这个出口的流量${NC}" >&2
+    _line
+    local i=1 key
+    declare -A m=()
+    for key in "${ROUTING_PRESET_ORDER[@]}"; do
+        _item "$i" "${ROUTING_PRESET_NAMES[$key]}"; m[$i]="$key"; ((i++))
+    done
+    _item "c" "自定义域名 / IP / geosite / geoip"
     _item "0" "返回"
     _line
-    local ch; read -rp "  请选择: " ch
-    local v=""
-    case "$ch" in
-        1) v="as_is" ;; 2) v="prefer_ipv4" ;; 3) v="prefer_ipv6" ;;
-        4) v="ipv4_only" ;; 5) v="ipv6_only" ;;
-        0|"") return ;;
-        *) _err "无效选择"; return ;;
-    esac
-    db_set_direct_ip_version "$v"
-    _ok "直连出口已设置为: $v"
+    echo -e "  ${D}支持多选：空格或逗号分隔${NC}" >&2
+    local input; read -rp "  请选择: " input
+    [[ -z "$input" || "$input" == "0" ]] && return
+    input=$(echo "$input" | tr ',' ' ' | tr -s ' ')
+
+    local tok types=() custom=""
+    for tok in $input; do
+        case "$tok" in
+            0) return ;;
+            c|C)
+                echo -e "  ${D}示例: openai.com,geosite:netflix,1.2.3.0/24${NC}" >&2
+                read -rp "  匹配规则: " custom
+                custom=$(echo "$custom" | tr -d '[:space:]')
+                [[ -z "$custom" ]] && { _err "不能为空"; return; } ;;
+            *)
+                if [[ "$tok" =~ ^[0-9]+$ ]] && [[ -n "${m[$tok]:-}" ]]; then types+=("${m[$tok]}")
+                else _err "无效选项: ${tok}"; return; fi ;;
+        esac
+    done
+
+    local added=0 t
+    for t in "${types[@]}"; do
+        db_add_routing_rule "$t" "bind:${ip}" "" "$iv" && {
+            _ok "${ROUTING_PRESET_NAMES[$t]} → 出口 ${ip}"; ((added++)); }
+    done
+    if [[ -n "$custom" ]]; then
+        db_add_routing_rule "custom" "bind:${ip}" "$custom" "$iv" && {
+            _ok "自定义[${custom}] → 出口 ${ip}"; ((added++)); }
+    fi
+    [[ "$added" -eq 0 ]] && { _warn "没有添加任何规则"; return; }
     reload_config
+    echo "" >&2
+    _ok "已生效。可用「出口绑定自检」验证实际出口 IP"
+}
+
+# 逐条验证绑定是否真的生效、有没有泄露风险
+verify_egress_binding() {
+    _line
+    echo -e "  ${W}出口绑定自检${NC}" >&2
+    _line
+    local rules; rules=$(db_routing_rules | jq -c '.[] | select(.outbound | startswith("bind:"))')
+    if [[ -z "$rules" ]]; then
+        echo -e "  ${D}没有出口绑定规则${NC}" >&2; _line; return
+    fi
+    _collect_local_ips
+    local r ip iv rtype ok
+    while IFS= read -r r; do
+        [[ -z "$r" ]] && continue
+        rtype=$(echo "$r" | jq -r '.type')
+        ip=$(echo "$r" | jq -r '.outbound | ltrimstr("bind:")')
+        iv=$(echo "$r" | jq -r '.ip_version // ""')
+        echo -e "  ${C}${rtype}${NC} → ${G}${ip}${NC}" >&2
+        # 地址是否还在本机
+        if printf '%s\n' "${LOCAL_IPS[@]}" | grep -qxF "$ip"; then
+            echo -e "    ${G}✓${NC} 地址仍在本机" >&2
+        else
+            echo -e "    ${R}✗${NC} 地址已不在本机，该规则会被跳过" >&2
+        fi
+        # 防泄露策略
+        case "$iv" in
+            prefer_ipv4|prefer_ipv6)
+                echo -e "    ${Y}!${NC} 允许回落：目标只有另一族地址时会泄露另一个本机 IP" >&2 ;;
+            *)
+                if [[ "$ip" == *:* ]]; then
+                    echo -e "    ${G}✓${NC} 严格 ipv6_only，不会回落到 IPv4" >&2
+                else
+                    echo -e "    ${G}✓${NC} 严格 ipv4_only" >&2
+                fi ;;
+        esac
+        # 实测该源地址出去看到的是什么
+        local seen
+        if [[ "$ip" == *:* ]]; then
+            seen=$(curl -s -6 --interface "$ip" --connect-timeout 6 --max-time 10 https://ipinfo.io/ip 2>/dev/null)
+        else
+            seen=$(curl -s -4 --interface "$ip" --connect-timeout 6 --max-time 10 https://ipinfo.io/ip 2>/dev/null)
+        fi
+        seen=$(echo "$seen" | tr -d '[:space:]')
+        if [[ -n "$seen" ]]; then
+            if [[ "$seen" == "$ip" ]]; then
+                echo -e "    ${G}✓${NC} 实测出口: ${seen}" >&2
+            else
+                echo -e "    ${Y}!${NC} 实测出口 ${seen} 与绑定地址不同（可能存在 NAT）" >&2
+            fi
+        else
+            echo -e "    ${D}·${NC} 实测跳过（该地址无法访问检测服务）" >&2
+        fi
+    done <<<"$rules"
+    _line
+    local d4; d4=$(_default_egress_ip 4)
+    [[ -n "$d4" ]] && echo -e "  ${D}未被规则命中的流量仍走默认出口 ${d4}${NC}" >&2
+    _line
+}
+
+configure_direct_outbound() {
+    while true; do
+        _header
+        echo -e "  ${W}直连出口设置${NC}" >&2
+        _line
+        echo -e "  当前全局直连 IP 版本: ${G}$(db_get_direct_ip_version)${NC}" >&2
+        local nb; nb=$(db_routing_rules | jq '[.[] | select(.outbound | startswith("bind:"))] | length')
+        echo -e "  出口 IP 绑定规则: ${G}${nb:-0}${NC} 条" >&2
+        _line
+        _item "1" "本机 IP 与地域分析"
+        _item "2" "按规则集绑定出口 IP ${D}(多 IPv6 分流)${NC}"
+        _item "3" "出口绑定自检 ${D}(验证是否泄露)${NC}"
+        _item "4" "删除出口绑定规则"
+        echo -e "  ${D}───────────────────────────────────────────${NC}" >&2
+        _item "5" "全局直连 IP 版本 ${D}(未命中规则的流量)${NC}"
+        _item "0" "返回"
+        _line
+        local ch; read -rp "  请选择: " ch
+        case "$ch" in
+            1) analyze_local_ips; _pause ;;
+            2) bind_egress_by_ruleset; _pause ;;
+            3) verify_egress_binding; _pause ;;
+            4)
+                local rules ids=() r i=1
+                rules=$(db_routing_rules | jq -c '.[] | select(.outbound | startswith("bind:"))')
+                if [[ -z "$rules" ]]; then _warn "没有出口绑定规则"; _pause; continue; fi
+                _line
+                while IFS= read -r r; do
+                    [[ -z "$r" ]] && continue
+                    _item "$i" "$(_rule_display_name "$(echo "$r" | jq -r '.type')" "$(echo "$r" | jq -r '.match // ""')") → $(echo "$r" | jq -r '.outbound | ltrimstr("bind:")')"
+                    ids+=("$(echo "$r" | jq -r '.id')"); ((i++))
+                done <<<"$rules"
+                _item "0" "取消"
+                _line
+                local dc; read -rp "  要删除的编号: " dc
+                [[ "$dc" == "0" || -z "$dc" ]] && continue
+                [[ "$dc" =~ ^[0-9]+$ ]] && (( dc >= 1 && dc <= ${#ids[@]} )) || { _err "无效选择"; _pause; continue; }
+                db_del_routing_rule "${ids[$((dc-1))]}"
+                reload_config
+                _ok "已删除"; _pause ;;
+            5)
+                _line
+                _item "1" "AsIs ${D}(默认，不做处理)${NC}"
+                _item "2" "优先 IPv4"
+                _item "3" "优先 IPv6"
+                _item "4" "仅 IPv4"
+                _item "5" "仅 IPv6"
+                _item "0" "返回"
+                _line
+                local vc v=""; read -rp "  请选择: " vc
+                case "$vc" in
+                    1) v="as_is" ;; 2) v="prefer_ipv4" ;; 3) v="prefer_ipv6" ;;
+                    4) v="ipv4_only" ;; 5) v="ipv6_only" ;;
+                    *) continue ;;
+                esac
+                db_set_direct_ip_version "$v"
+                _ok "全局直连出口已设为: $v"
+                reload_config; _pause ;;
+            0) return ;;
+            *) _err "无效选择"; sleep 1 ;;
+        esac
+    done
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -9768,10 +9668,6 @@ do_uninstall() {
         _ask_yes "是否同时卸载 WARP?" && uninstall_warp
     fi
 
-    if _realm_installed || [[ -f "$REALM_CONF" ]]; then
-        _ask_yes "同时卸载 realm 端口转发?" && uninstall_realm
-    fi
-
     _info "删除服务单元..."
     local s
     if [[ "$DISTRO" == "alpine" ]]; then
@@ -10096,14 +9992,12 @@ main_menu() {
             _item "12" "完全卸载"
             _item "13" "证书管理 ${D}(申请 / 续期 / 换域名)${NC}"
             _item "14" "备份 / 恢复配置 ${D}(重装系统迁移)${NC}"
-            _item "15" "Realm 端口转发 ${D}(中转机 → 落地机)${NC}"
         else
             _item "1" "安装协议"
             echo -e "  ${D}───────────────────────────────────────────${NC}" >&2
             _item "9" "网络调优 ${D}(BBR3 / 双栈 / NAT / sysctl)${NC}"
             _item "11" "检查脚本更新"
             _item "14" "从备份恢复配置 ${D}(重装系统后使用)${NC}"
-            _item "15" "Realm 端口转发 ${D}(纯中转机也可单独用)${NC}"
         fi
         _item "0" "退出"
         _line
@@ -10124,7 +10018,6 @@ main_menu() {
             11) do_update ;;
             12) [[ -n "$installed" ]] && do_uninstall || _err "无效选择" ;;
             13) [[ -n "$installed" ]] && { manage_certificates; skip=true; } || _err "无效选择" ;;
-            15) manage_realm; skip=true ;;
             14)
                 if [[ -z "$installed" ]]; then
                     do_restore ""
@@ -10172,13 +10065,6 @@ case "${1:-}" in
         check_root; init_db; sync_traffic_counters; show_port_traffic; exit 0 ;;
     --cert-check)
         check_root; init_db; cert_check_and_renew; exit 0 ;;
-    --realm-status)
-        check_root; init_db
-        if _realm_installed; then
-            echo "realm v$(_realm_version)  规则 $(realm_count) 条"
-            realm_show_rules
-        else echo "realm 未安装"; fi
-        exit 0 ;;
     --firewall-status)
         check_root; init_db; show_firewall_footprint; exit 0 ;;
     --cert-fix)
@@ -10214,7 +10100,6 @@ case "${1:-}" in
   --show-traffic    显示端口级流量统计
   --cert-check      检查证书剩余天数，不足 20 天时自动续期（用于定时任务）
   --cert-status     显示证书状态与各协议 SNI
-  --realm-status    显示 realm 端口转发规则
   --firewall-status 审计本脚本写入的防火墙规则
   --firewall-status 审计脚本写入了哪些防火墙规则
   --cert-fix        重新识别现有证书并补齐自动续期链路（恢复备份后用）
