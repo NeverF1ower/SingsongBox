@@ -4056,6 +4056,30 @@ _sb_inbound_raw() {
 #═══════════════════════════════════════════════════════════════════════════════
 # 出站生成
 #═══════════════════════════════════════════════════════════════════════════════
+# sing-box 1.12 起 outbound.domain_strategy 被废弃，1.14 将移除。
+# 新写法是 outbound.domain_resolver = {server, strategy}，需要 dns.servers 里有对应 tag。
+# 这里按实际内核版本选择写法，老内核继续用 legacy 字段。
+readonly SB_DNS_TAG="dns-local"
+_sb_uses_legacy_domain_strategy() {
+    local v; v=$(_sb_version 2>/dev/null)
+    [[ -z "$v" ]] && return 1
+    _version_ge "$v" "1.12" && return 1
+    return 0
+}
+
+# _sb_apply_domain_strategy <出站JSON> <策略>
+# 策略为空则原样返回
+_sb_apply_domain_strategy() {
+    local ob="$1" ds="$2"
+    [[ -z "$ds" ]] && { echo "$ob"; return 0; }
+    if _sb_uses_legacy_domain_strategy; then
+        echo "$ob" | jq -c --arg d "$ds" '.domain_strategy = $d'
+    else
+        echo "$ob" | jq -c --arg d "$ds" --arg srv "$SB_DNS_TAG" \
+            '.domain_resolver = {server:$srv, strategy:$d}'
+    fi
+}
+
 _sb_direct_outbound() {  # tag ip_version
     local tag="$1" iv="$2" ds=""
     case "$iv" in
@@ -4064,11 +4088,7 @@ _sb_direct_outbound() {  # tag ip_version
         prefer_ipv4) ds="prefer_ipv4" ;;
         prefer_ipv6) ds="prefer_ipv6" ;;
     esac
-    if [[ -n "$ds" ]]; then
-        jq -nc --arg t "$tag" --arg d "$ds" '{type:"direct", tag:$t, domain_strategy:$d}'
-    else
-        jq -nc --arg t "$tag" '{type:"direct", tag:$t}'
-    fi
+    _sb_apply_domain_strategy "$(jq -nc --arg t "$tag" '{type:"direct", tag:$t}')" "$ds"
 }
 
 # 绑定本机某个 IP 出站的 tag
@@ -4096,8 +4116,9 @@ _sb_bind_outbound() {
     case "$iv" in
         prefer_ipv4|prefer_ipv6) ds="$iv" ;;
     esac
-    jq -nc --arg t "$tag" --arg f "$field" --arg ip "$ip" --arg d "$ds" \
-        '{type:"direct", tag:$t, domain_strategy:$d} | .[$f] = $ip'
+    _sb_apply_domain_strategy \
+        "$(jq -nc --arg t "$tag" --arg f "$field" --arg ip "$ip" '{type:"direct", tag:$t} | .[$f] = $ip')" \
+        "$ds"
 }
 
 _direct_tag_for() {  # ip_version -> outbound tag
@@ -4445,10 +4466,19 @@ generate_singbox_config() {
     # 全局直连出口 IP 版本（作用于默认 direct）
     local gdiv; gdiv=$(db_get_direct_ip_version)
     if [[ "$gdiv" != "as_is" ]]; then
-        outbounds=$(echo "$outbounds" | jq -c --arg d "$(
-            case "$gdiv" in ipv4_only) echo ipv4_only;; ipv6_only) echo ipv6_only;;
-                            prefer_ipv6) echo prefer_ipv6;; *) echo prefer_ipv4;; esac)" \
-            'map(if .tag == "direct" then .domain_strategy = $d else . end)')
+        local gds base patched
+        case "$gdiv" in
+            ipv4_only)   gds=ipv4_only ;;
+            ipv6_only)   gds=ipv6_only ;;
+            prefer_ipv6) gds=prefer_ipv6 ;;
+            *)           gds=prefer_ipv4 ;;
+        esac
+        base=$(echo "$outbounds" | jq -c '.[] | select(.tag == "direct")')
+        if [[ -n "$base" ]]; then
+            patched=$(_sb_apply_domain_strategy "$base" "$gds")
+            outbounds=$(jq -nc --argjson a "$outbounds" --argjson p "$patched" \
+                '$a | map(if .tag == "direct" then $p else . end)')
+        fi
     fi
 
     # WARP
@@ -4611,6 +4641,12 @@ generate_singbox_config() {
          outbounds:$oub,
          route:$route,
          experimental:{cache_file:{enabled:true, path:$cache}}}')
+    # 新版 domain_resolver 引用的 DNS 服务器必须存在
+    if ! _sb_uses_legacy_domain_strategy; then
+        conf=$(echo "$conf" | jq -c --arg t "$SB_DNS_TAG" \
+            '.dns = {servers:[{type:"local", tag:$t}]}
+             | .route.default_domain_resolver = $t')
+    fi
     [[ "$(echo "$endpoints" | jq 'length')" != "0" ]] && \
         conf=$(echo "$conf" | jq -c --argjson e "$endpoints" '.endpoints = $e')
 
@@ -4620,7 +4656,10 @@ generate_singbox_config() {
 
     if [[ -x "$SB_BIN" ]]; then
         local check_out
-        if ! check_out=$("$SB_BIN" check -c "${SB_CONFIG}.tmp" 2>&1); then
+        # 与 systemd 单元保持一致：老配置仍可能含 legacy 字段，
+        # 否则会出现"服务跑得起来但 check 报错"的割裂
+        if ! check_out=$(ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true \
+                         "$SB_BIN" check -c "${SB_CONFIG}.tmp" 2>&1); then
             _err "Sing-box 配置校验失败:"
             echo "$check_out" | head -8 | sed 's/^/    /' >&2
             rm -f "${SB_CONFIG}.tmp"
@@ -9356,7 +9395,8 @@ manage_protocol_services() {
             4) generate_singbox_config && reload_config; _pause ;;
             5)
                 if [[ -f "$SB_CONFIG" ]]; then
-                    "$SB_BIN" check -c "$SB_CONFIG" && _ok "配置校验通过" || _err "配置校验失败"
+                    ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true \
+                        "$SB_BIN" check -c "$SB_CONFIG" && _ok "配置校验通过" || _err "配置校验失败"
                 else
                     _warn "配置文件不存在"
                 fi
