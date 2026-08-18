@@ -9,7 +9,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
 fi
 
 #═══════════════════════════════════════════════════════════════════════════════
-#  SingBox 万能工具箱 v0.0.5 [Sing-box 统一内核]
+#  SingBox 万能工具箱 v0.0.6 [Sing-box 统一内核]
 #
 #  架构:
 #    • Sing-box 内核: 承载除 Snell 外的全部协议（TCP/TLS/QUIC 统一管理）
@@ -25,7 +25,7 @@ fi
 #  适配: Alpine / Debian / Ubuntu / CentOS
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="0.0.5"
+readonly VERSION="0.0.6"
 readonly AUTHOR="NeverF1ower"
 readonly SCRIPT_NAME="SingBox 万能工具箱"
 
@@ -278,12 +278,54 @@ ensure_dual_stack_listen() {
     sysctl -p /etc/sysctl.d/99-vless-dualstack.conf >/dev/null 2>&1
 }
 
+_has_ipv4_network() {
+    if check_cmd ip; then
+        ip -4 addr show scope global 2>/dev/null | grep -q 'inet ' &&
+            ip -4 route show default 2>/dev/null | grep -q '^default' && return 0
+    fi
+    # /proc/net/route 的目标 00000000 表示 IPv4 默认路由；不依赖 ping/curl。
+    local _ dest flags
+    while read -r _ dest _ flags _; do
+        [[ "$dest" == "00000000" && "$flags" =~ ^[0-9A-Fa-f]+$ ]] || continue
+        (( (16#$flags & 1) != 0 )) && return 0
+    done </proc/net/route 2>/dev/null
+    return 1
+}
+
+_has_ipv6_network() {
+    if check_cmd ip; then
+        ip -6 addr show scope global 2>/dev/null | grep -q 'inet6 ' &&
+            ip -6 route show default 2>/dev/null | grep -q '^default' && return 0
+    fi
+    [[ -s /proc/net/if_inet6 ]] && grep -qE '^00000000000000000000000000000000[[:space:]]' \
+        /proc/net/ipv6_route 2>/dev/null
+}
+
 configure_dns64() {
-    ping -c 1 -W 2 8.8.8.8 &>/dev/null && return 0
-    _warn "检测到纯 IPv6 环境，配置 DNS64..."
-    [[ -f /etc/resolv.conf && ! -f /etc/resolv.conf.bak ]] && cp /etc/resolv.conf /etc/resolv.conf.bak
-    printf 'nameserver 2a00:1098:2b::1\nnameserver 2001:4860:4860::6464\n' >/etc/resolv.conf
-    _ok "DNS64 已配置"
+    _has_ipv4_network && return 0
+    if ! _has_ipv6_network; then
+        _warn "无法确认当前为纯 IPv6 网络，跳过 DNS64 自动配置"
+        return 0
+    fi
+
+    # resolv.conf 常由 systemd-resolved、NetworkManager 或容器运行时管理。
+    # 覆盖符号链接既可能失效，也可能破坏系统 DNS，因此只处理普通文件。
+    if [[ -L /etc/resolv.conf || ! -f /etc/resolv.conf ]]; then
+        _warn "检测到纯 IPv6 网络，但 /etc/resolv.conf 由系统管理，未自动覆盖"
+        echo -e "  ${D}请在网络管理器中配置支持 DNS64 的解析器后重试${NC}" >&2
+        return 0
+    fi
+
+    grep -qE '^nameserver[[:space:]]+(2a00:1098:2b::1|2001:4860:4860::6464)([[:space:]]|$)' \
+        /etc/resolv.conf 2>/dev/null && return 0
+    _warn "确认当前为纯 IPv6 网络，准备配置 DNS64..."
+    [[ ! -e /etc/resolv.conf.singsongbox.bak ]] &&
+        cp -a /etc/resolv.conf /etc/resolv.conf.singsongbox.bak
+    printf 'nameserver 2a00:1098:2b::1\nnameserver 2001:4860:4860::6464\n' >/etc/resolv.conf || {
+        _err "DNS64 配置失败，原文件未删除"
+        return 1
+    }
+    _ok "DNS64 已配置（原文件: /etc/resolv.conf.singsongbox.bak）"
 }
 
 sync_time() {
@@ -473,14 +515,45 @@ _sha256_file() {
 }
 
 _archive_safe() {  # _archive_safe <file> <zip|tar.gz>
-    local f="$1" kind="$2" entries e
+    local f="$1" kind="$2" entries details e type
     case "$kind" in
         zip) entries=$(unzip -Z1 "$f" 2>/dev/null) || return 1 ;;
-        tar.gz) entries=$(tar -tzf "$f" 2>/dev/null) || return 1 ;;
+        tar.gz)
+            entries=$(tar -tzf "$f" 2>/dev/null) || return 1
+            details=$(tar -tvzf "$f" 2>/dev/null) || return 1
+            while IFS= read -r e; do
+                type="${e:0:1}"
+                case "$type" in l|h|b|c|p|s) return 1 ;; esac
+            done <<<"$details"
+            ;;
         *) return 1 ;;
     esac
     while IFS= read -r e; do
-        case "$e" in /*|../*|*/../*|*/..) return 1 ;; esac
+        [[ "$e" == *$'\r'* || "$e" == *$'\n'* ]] && return 1
+        case "$e" in /*|../*|*/../*|*/..|..|*\\*) return 1 ;; esac
+    done <<<"$entries"
+}
+
+_tree_safe() {  # 解包后拒绝符号链接、设备、FIFO 与 socket
+    local root="$1" bad
+    [[ -d "$root" ]] || return 1
+    bad=$(find "$root" \( -type l -o -type b -o -type c -o -type p -o -type s -o \
+        \( -type f \( -perm -4000 -o -perm -2000 \) \) \) -print -quit 2>/dev/null)
+    [[ -z "$bad" ]]
+}
+
+_restore_archive_safe() {
+    local f="$1" entries e n
+    _archive_safe "$f" tar.gz || return 1
+    entries=$(tar -tzf "$f" 2>/dev/null) || return 1
+    while IFS= read -r e; do
+        n="${e#./}"; n="${n%/}"
+        case "$n" in
+            ""|etc|acme|meta.txt|etc/db.json|etc/warp.json|etc/sub_uuid|etc/sub.info|\
+            etc/cert_domain|etc/cert_meta|etc/dns_api.conf|etc/decoy_site_port|\
+            etc/certs|etc/certs/*|acme/*) ;;
+            *) _warn "备份包含非预期路径: $e"; return 1 ;;
+        esac
     done <<<"$entries"
 }
 
@@ -488,18 +561,23 @@ _archive_safe() {  # _archive_safe <file> <zip|tar.gz>
 # 依赖安装
 #═══════════════════════════════════════════════════════════════════════════════
 check_dependencies() {
+    local install_optional="${1:-true}"
     configure_dns64
     local missing=() cmd
-    for cmd in curl jq openssl; do check_cmd "$cmd" || missing+=("$cmd"); done
+    for cmd in curl jq openssl ip ss iptables tar unzip; do
+        check_cmd "$cmd" || missing+=("$cmd")
+    done
     check_cmd crontab || missing+=("cron")
-    check_cmd iptables || missing+=("iptables")
-    [[ ${#missing[@]} -eq 0 ]] && { _install_optional_tools; return 0; }
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        [[ "$install_optional" == "true" ]] && _install_optional_tools
+        return 0
+    fi
 
     _info "安装缺失依赖: ${missing[*]}"
     case "$DISTRO" in
         alpine)
             apk update >/dev/null 2>&1
-            apk add --no-cache curl jq openssl coreutils ca-certificates gawk unzip \
+            apk add --no-cache curl jq openssl coreutils ca-certificates gawk tar unzip \
                 iproute2 iptables ip6tables gcompat libc6-compat xz bind-tools >/dev/null 2>&1
             check_cmd crontab || apk add --no-cache cronie >/dev/null 2>&1 || apk add --no-cache dcron >/dev/null 2>&1
             rc-service cronie start >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
@@ -507,21 +585,23 @@ check_dependencies() {
             ;;
         centos)
             yum install -y epel-release >/dev/null 2>&1
-            yum install -y curl jq openssl ca-certificates cronie unzip iproute iptables xz bind-utils >/dev/null 2>&1
+            yum install -y curl jq openssl ca-certificates cronie tar unzip iproute iptables xz bind-utils >/dev/null 2>&1
             systemctl enable --now crond >/dev/null 2>&1 || true
             ;;
         debian|ubuntu)
             apt-get update -qq >/dev/null 2>&1
             DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl jq openssl ca-certificates \
-                cron unzip iproute2 iptables xz-utils dnsutils >/dev/null 2>&1
+                cron tar unzip iproute2 iptables xz-utils dnsutils >/dev/null 2>&1
             systemctl enable --now cron >/dev/null 2>&1 || true
             ;;
     esac
-    for cmd in curl jq openssl; do
+    for cmd in curl jq openssl ip ss iptables tar unzip; do
         check_cmd "$cmd" || { _err "依赖安装失败: $cmd"; return 1; }
     done
+    check_cmd crontab || _warn "计划任务工具未安装，证书续期与过期用户清理将不可用"
     _ok "依赖安装完成"
-    _install_optional_tools
+    [[ "$install_optional" == "true" ]] && _install_optional_tools
+    return 0
 }
 
 _install_optional_tools() {
@@ -1174,8 +1254,8 @@ _verify_sha256() {  # file expected
 }
 
 _sb_version() {
-    check_cmd sing-box || { echo ""; return; }
-    sing-box version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-.a-zA-Z0-9]*)?' | head -1
+    [[ -x "$SB_BIN" ]] || { echo ""; return; }
+    "$SB_BIN" version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-.a-zA-Z0-9]*)?' | head -1
 }
 
 _version_ge() {  # _version_ge a b -> a >= b
@@ -1201,7 +1281,7 @@ _confirm_unverified() {  # _confirm_unverified <名称>
         return 1
     fi
     echo "" >&2
-    _warn "${what}: GitHub API 未提供该资产的 SHA-256（旧版本 Release 常见）"
+    _warn "${what}: GitHub API 未提供可独立验证的 SHA-256"
     echo -e "  ${D}文件已通过 HTTPS 从 github.com 下载，但缺少独立哈希校验${NC}" >&2
     local a
     read -rp "  是否仍要继续安装? [y/N]: " a
@@ -1219,7 +1299,12 @@ install_singbox() {
     fi
 
     local arch; arch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构: $(uname -m)"; return 1; }
-    [[ "$DISTRO" == "alpine" ]] && apk add --no-cache gcompat libc6-compat >/dev/null 2>&1
+    if [[ "$DISTRO" == "alpine" ]]; then
+        apk add --no-cache gcompat libc6-compat >/dev/null 2>&1 || {
+            _err "Alpine Sing-box 兼容运行环境安装失败"
+            return 1
+        }
+    fi
 
     local ver="$ver_override"
     if [[ -z "$ver" ]]; then
@@ -1245,6 +1330,7 @@ install_singbox() {
     fi
     _archive_safe "$tmp/pkg.tar.gz" tar.gz || { rm -rf "$tmp"; _err "压缩包路径校验失败"; return 1; }
     tar -xzf "$tmp/pkg.tar.gz" -C "$tmp" || { rm -rf "$tmp"; _err "解压失败"; return 1; }
+    _tree_safe "$tmp" || { rm -rf "$tmp"; _err "压缩包含链接或特殊文件，已拒绝安装"; return 1; }
     local bin; bin=$(find "$tmp" -type f -name 'sing-box' -print -quit)
     [[ -z "$bin" ]] && { rm -rf "$tmp"; _err "未找到 sing-box 二进制"; return 1; }
     install -m 755 "$bin" "$SB_BIN" || { rm -rf "$tmp"; _err "安装失败"; return 1; }
@@ -1323,6 +1409,7 @@ _install_snell_generic() {  # version target_bin
     fi
     _archive_safe "$tmp/s.zip" zip && unzip -oq "$tmp/s.zip" -d "$tmp" || {
         rm -rf "$tmp"; _err "Snell 压缩包无效"; return 1; }
+    _tree_safe "$tmp" || { rm -rf "$tmp"; _err "Snell 压缩包含链接或特殊文件"; return 1; }
     [[ -f "$tmp/snell-server" ]] || { rm -rf "$tmp"; _err "压缩包内未找到 snell-server"; return 1; }
     install -m 755 "$tmp/snell-server" "$tmp/staged" || { rm -rf "$tmp"; return 1; }
     _prepare_snell_binary "$tmp/staged" || { rm -rf "$tmp"; _err "Snell 兼容处理失败"; return 1; }
@@ -1855,28 +1942,35 @@ install_acme_tool() {
     check_cmd curl || { _err "缺少 curl"; return 1; }
     check_cmd tar  || { _err "缺少 tar"; return 1; }
 
-    local tmp tarball url ok=false
+    local tag tmp tarball url ok=false
+    tag=$(_gh_latest_tag "acmesh-official/acme.sh")
+    [[ -n "$tag" && "$tag" =~ ^[0-9A-Za-z._-]+$ ]] || {
+        _err "无法取得 acme.sh 的稳定版本号，已拒绝从 master 分支安装"
+        return 1
+    }
     tmp=$(mktemp -d) || return 1
     tarball="$tmp/acme.tar.gz"
     for url in \
-        "https://github.com/acmesh-official/acme.sh/archive/refs/heads/master.tar.gz" \
-        "https://gh-proxy.com/https://github.com/acmesh-official/acme.sh/archive/refs/heads/master.tar.gz" \
-        "https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/heads/master"; do
+        "https://github.com/acmesh-official/acme.sh/archive/refs/tags/${tag}.tar.gz" \
+        "https://codeload.github.com/acmesh-official/acme.sh/tar.gz/refs/tags/${tag}"; do
         _info "拉取: ${url%%\?*}"
         if curl -fsSL --connect-timeout 12 --max-time 120 -o "$tarball" "$url" 2>/dev/null &&
-           [[ -s "$tarball" ]] && tar -tzf "$tarball" >/dev/null 2>&1; then
+           [[ -s "$tarball" ]] && _archive_safe "$tarball" tar.gz; then
             ok=true; break
         fi
         _warn "该地址不可用，尝试下一个"
     done
     if [[ "$ok" != "true" ]]; then
         rm -rf "$tmp"
-        _err "acme.sh 下载失败（GitHub 与镜像均不可达）"
-        echo -e "  ${D}可手动执行: curl https://get.acme.sh | sh -s email=你的邮箱${NC}" >&2
+        _err "acme.sh v${tag} 下载失败（GitHub 不可达）"
         return 1
     fi
 
+    # GitHub 自动生成的源码包没有独立 SHA-256；明确征得同意后才执行其中的安装器。
+    _confirm_unverified "acme.sh v${tag} 源码包" || { rm -rf "$tmp"; return 1; }
+
     tar -xzf "$tarball" -C "$tmp" || { rm -rf "$tmp"; _err "解包失败"; return 1; }
+    _tree_safe "$tmp" || { rm -rf "$tmp"; _err "acme.sh 压缩包含链接或特殊文件"; return 1; }
     local src; src=$(find "$tmp" -maxdepth 1 -type d -name 'acme.sh-*' | head -1)
     if [[ -z "$src" || ! -f "$src/acme.sh" ]]; then
         rm -rf "$tmp"; _err "压缩包结构异常，未找到 acme.sh"; return 1
@@ -2932,20 +3026,26 @@ _install_decoy_template() {
     tmp=$(mktemp -d) || return 1
     z="$tmp/html${n}.zip"
     local ok=false
-    for url in "${DECOY_TPL_BASE}/html${n}.zip" "https://gh-proxy.com/${DECOY_TPL_BASE}/html${n}.zip"; do
+    local urls=("${DECOY_TPL_BASE}/html${n}.zip")
+    [[ "${ALLOW_THIRD_PARTY_MIRRORS:-0}" == "1" ]] && urls+=("https://gh-proxy.com/${DECOY_TPL_BASE}/html${n}.zip")
+    for url in "${urls[@]}"; do
         _info "下载伪装站模板 ${n} (${DECOY_TPL_NAME[$n]}) ..."
         if curl -fsSL --connect-timeout 12 --max-time 120 -o "$z" "$url" 2>/dev/null &&
-           [[ -s "$z" ]] && unzip -tq "$z" >/dev/null 2>&1; then
+           [[ -s "$z" ]] && _archive_safe "$z" zip; then
             ok=true; break
         fi
-        _warn "该地址不可用，尝试镜像"
+        _warn "该地址不可用"
     done
     [[ "$ok" != "true" ]] && { rm -rf "$tmp"; _err "模板下载失败"; return 1; }
+    _confirm_unverified "伪装站模板 ${n}" || { rm -rf "$tmp"; return 1; }
 
+    mkdir -p "$tmp/site"
+    unzip -o -q "$z" -d "$tmp/site" || { rm -rf "$tmp"; _err "解压失败"; return 1; }
+    _tree_safe "$tmp/site" || { rm -rf "$tmp"; _err "模板包含链接或特殊文件"; return 1; }
     mkdir -p "$SITE_ROOT"
     # 旧内容先清掉，避免不同模板的残留文件混在一起
     find "$SITE_ROOT" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
-    unzip -o -q "$z" -d "$SITE_ROOT" || { rm -rf "$tmp"; _err "解压失败"; return 1; }
+    cp -a "$tmp/site/." "$SITE_ROOT/" || { rm -rf "$tmp"; _err "写入模板失败"; return 1; }
     rm -rf "$tmp" "$SITE_ROOT/__MACOSX"
     # 某些模板解压后多一层目录，把内容提上来
     if [[ ! -f "$SITE_ROOT/index.html" ]]; then
@@ -5034,7 +5134,7 @@ start_services() {
 
     local sb_protos; sb_protos=$(get_singbox_protocols)
     if [[ -n "$sb_protos" ]]; then
-        check_cmd sing-box || install_singbox || failed+=("$SB_SVC")
+        [[ -x "$SB_BIN" ]] || install_singbox || failed+=("$SB_SVC")
         gen_hop_nat_script
         if generate_singbox_config; then
             create_singbox_service
@@ -5135,10 +5235,21 @@ reload_config() {
 # 快捷命令
 #───────────────────────────────────────────────────────────────────────────────
 create_shortcut() {
-    local sys="/usr/local/bin/vless-server.sh" src
+    local sys="/usr/local/bin/vless-server.sh" src src_ver sys_ver keep_system=false
     src=$(readlink -f "$0" 2>/dev/null || echo "$0")
     if [[ -f "$src" && "$src" != "$sys" ]]; then
-        install -m 755 "$src" "$sys" 2>/dev/null || { _warn "无法写入 $sys"; return 1; }
+        if [[ -f "$sys" ]] && ! cmp -s "$src" "$sys"; then
+            src_ver=$(sed -n 's/^readonly VERSION="\([^"]*\)".*/\1/p' "$src" | head -1)
+            sys_ver=$(sed -n 's/^readonly VERSION="\([^"]*\)".*/\1/p' "$sys" | head -1)
+            if [[ -z "$src_ver" || -z "$sys_ver" || "$src_ver" == "$sys_ver" ]] ||
+               _version_ge "$sys_ver" "$src_ver"; then
+                keep_system=true
+                _warn "已保留现有系统脚本 v${sys_ver:-unknown}，未用 v${src_ver:-unknown} 覆盖"
+            fi
+        fi
+        if [[ "$keep_system" != "true" ]]; then
+            install -m 755 "$src" "$sys" 2>/dev/null || { _warn "无法写入 $sys"; return 1; }
+        fi
     fi
     [[ -f "$sys" ]] || { _warn "未找到脚本文件，跳过快捷命令创建"; return 1; }
     chmod 755 "$sys"
@@ -5149,13 +5260,25 @@ create_shortcut() {
 }
 
 _auto_sync_system_script() {
-    local sys="/usr/local/bin/vless-server.sh" src cur sys_md5
+    local sys="/usr/local/bin/vless-server.sh" src src_ver sys_ver
     src=$(readlink -f "$0" 2>/dev/null || echo "$0")
     [[ -f "$src" && "$src" != "$sys" ]] || return 0
     if [[ ! -f "$sys" ]]; then install -m 755 "$src" "$sys" 2>/dev/null; return 0; fi
-    cur=$(md5sum "$src" 2>/dev/null | cut -d' ' -f1)
-    sys_md5=$(md5sum "$sys" 2>/dev/null | cut -d' ' -f1)
-    [[ "$cur" == "$sys_md5" ]] && return 0
+    cmp -s "$src" "$sys" && return 0
+    src_ver=$(sed -n 's/^readonly VERSION="\([^"]*\)".*/\1/p' "$src" | head -1)
+    sys_ver=$(sed -n 's/^readonly VERSION="\([^"]*\)".*/\1/p' "$sys" | head -1)
+    if [[ -z "$src_ver" || -z "$sys_ver" ]]; then
+        _warn "检测到系统脚本内容不同，但无法比较版本，已跳过自动覆盖"
+        return 0
+    fi
+    if [[ "$src_ver" == "$sys_ver" ]]; then
+        _warn "系统脚本同为 v${sys_ver} 但内容不同，已保留现有版本"
+        return 0
+    fi
+    if _version_ge "$sys_ver" "$src_ver"; then
+        _warn "系统脚本 v${sys_ver} 新于当前文件 v${src_ver}，已阻止自动降级"
+        return 0
+    fi
     install -m 755 "$src" "$sys" 2>/dev/null && {
         ln -sf "$sys" /usr/local/bin/vless 2>/dev/null
         ln -sf "$sys" /usr/bin/vless 2>/dev/null
@@ -5187,15 +5310,23 @@ download_wgcf() {
     local ver; ver=$(_gh_latest_tag "ViRb3/wgcf"); ver="${ver#v}"
     [[ -z "$ver" ]] && ver="2.2.29"
     _info "下载 wgcf v${ver}..."
-    local urls=(
-        "https://github.com/ViRb3/wgcf/releases/download/v${ver}/wgcf_${ver}_linux_${arch}"
-        "https://gh-proxy.com/https://github.com/ViRb3/wgcf/releases/download/v${ver}/wgcf_${ver}_linux_${arch}"
-    )
+    local asset="wgcf_${ver}_linux_${arch}" expect
+    expect=$(_gh_asset_sha256 "ViRb3/wgcf" "v${ver}" "$asset" 2>/dev/null)
+    local urls=("https://github.com/ViRb3/wgcf/releases/download/v${ver}/${asset}")
+    # 只有取得官方哈希或用户显式允许第三方镜像时，才使用代理下载地址。
+    if [[ -n "$expect" || "${ALLOW_THIRD_PARTY_MIRRORS:-0}" == "1" ]]; then
+        urls+=("https://gh-proxy.com/https://github.com/ViRb3/wgcf/releases/download/v${ver}/${asset}")
+    fi
     local u tmp; tmp=$(mktemp) || return 1
     for u in "${urls[@]}"; do
         if curl -fsSL -A "Mozilla/5.0" --connect-timeout 15 --max-time 90 -o "$tmp" "$u"; then
             local size; size=$(stat -c%s "$tmp" 2>/dev/null || echo 0)
             if [[ "$size" -gt 100000 ]]; then
+                if [[ -n "$expect" ]]; then
+                    _verify_sha256 "$tmp" "$expect" || { _warn "wgcf SHA-256 不匹配，拒绝该下载源"; : >"$tmp"; continue; }
+                else
+                    _confirm_unverified "wgcf v${ver}" || { rm -f "$tmp"; return 1; }
+                fi
                 install -m 755 "$tmp" /usr/local/bin/wgcf && rm -f "$tmp" && { _ok "wgcf 已安装"; return 0; }
             fi
         fi
@@ -6210,7 +6341,7 @@ check_node_latency() {  # node_name -> "延迟ms|解析IP" 或 "超时|IP"
     local name="$1" node
     node=$(db_chain_node "$name") || { echo "超时|-"; return; }
     [[ -z "$node" ]] && { echo "超时|-"; return; }
-    check_cmd sing-box || { echo "N/A|-"; return; }
+    [[ -x "$SB_BIN" ]] || { echo "N/A|-"; return; }
 
     local server ip
     server=$(echo "$node" | jq -r '.server')
@@ -9626,11 +9757,12 @@ update_core_menu() {
 # 脚本更新 / 完全卸载
 #═══════════════════════════════════════════════════════════════════════════════
 # 从 GitHub 拉取最新脚本并对比版本
-# 依赖 SCRIPT_RAW_URL（raw.githubusercontent.com），可用镜像回退
+# 依赖 SCRIPT_RAW_URL（raw.githubusercontent.com）；第三方镜像默认关闭
 _raw_mirrors() {
     local u="$1"
     echo "$u"
     [[ "$u" != https://raw.githubusercontent.com/* ]] && return 0
+    [[ "${ALLOW_THIRD_PARTY_MIRRORS:-0}" == "1" ]] || return 0
 
     # gh-proxy 直接前缀即可
     echo "https://gh-proxy.com/${u}"
@@ -9692,21 +9824,23 @@ do_update() {
     }
     _line
 
-    local tmp url got=false
+    local tmp url fetched_url="" got=false
     tmp=$(mktemp) || return 1
     while IFS= read -r url; do
         [[ -z "$url" ]] && continue
         _info "拉取: ${url}"
         if curl -fsSL --connect-timeout 10 --max-time 60 -o "$tmp" "$url" 2>/dev/null &&
            [[ -s "$tmp" ]] && head -1 "$tmp" | grep -q '^#!.*bash'; then
-            got=true; break
+            got=true; fetched_url="$url"; break
         fi
         _warn "该地址不可用，尝试下一个"
     done < <(_raw_mirrors "$SCRIPT_RAW_URL")
 
     if [[ "$got" != "true" ]]; then
         rm -f "$tmp"
-        _err "下载失败：GitHub 与镜像均不可达"
+        _err "下载失败：GitHub Raw 不可达"
+        [[ "${ALLOW_THIRD_PARTY_MIRRORS:-0}" != "1" ]] &&
+            echo -e "  ${D}如确认镜像可信，可设置 ALLOW_THIRD_PARTY_MIRRORS=1 后重试${NC}" >&2
         echo -e "  ${D}可稍后重试，或手动: wget -O /usr/local/bin/vless-server.sh '<raw地址>'${NC}" >&2
         return 1
     fi
@@ -9714,6 +9848,16 @@ do_update() {
     # 语法校验 + 版本提取，避免把坏脚本写进系统
     if ! bash -n "$tmp" 2>/dev/null; then
         rm -f "$tmp"; _err "下载的脚本语法校验失败，已放弃更新"; return 1
+    fi
+    if ! grep -qx 'readonly AUTHOR="NeverF1ower"' "$tmp" ||
+       ! grep -qx 'readonly SCRIPT_NAME="SingBox 万能工具箱"' "$tmp"; then
+        rm -f "$tmp"; _err "下载文件的作者或脚本标识不匹配，已拒绝更新"; return 1
+    fi
+    if [[ -n "${VLESS_SCRIPT_SHA256:-}" ]] && ! _verify_sha256 "$tmp" "$VLESS_SCRIPT_SHA256"; then
+        rm -f "$tmp"; _err "下载脚本与 VLESS_SCRIPT_SHA256 不匹配，已拒绝更新"; return 1
+    fi
+    if [[ "$fetched_url" != "$SCRIPT_RAW_URL" ]]; then
+        _warn "本次脚本由第三方镜像传输，未提供 VLESS_SCRIPT_SHA256 时无法独立验证内容"
     fi
     local remote; remote=$(grep -m1 '^readonly VERSION=' "$tmp" | cut -d'"' -f2)
     if [[ -z "$remote" ]]; then
@@ -9729,6 +9873,11 @@ do_update() {
         fi
         _warn "版本号相同但文件内容有差异（作者可能未提版本号）"
         _ask_yes "仍要覆盖为远程版本?" || { rm -f "$tmp"; return 0; }
+    elif _version_ge "$VERSION" "$remote" && [[ "${ALLOW_SCRIPT_DOWNGRADE:-0}" != "1" ]]; then
+        rm -f "$tmp"
+        _err "远程版本 v${remote} 旧于当前 v${VERSION}，已阻止降级"
+        echo -e "  ${D}确需降级时可设置 ALLOW_SCRIPT_DOWNGRADE=1${NC}" >&2
+        return 1
     else
         _ask_yes "更新到 v${remote}?" || { rm -f "$tmp"; return 0; }
     fi
@@ -9869,12 +10018,32 @@ do_restore() {
         read -rp "  备份文件路径: " src
     fi
     [[ -f "$src" ]] || { _err "文件不存在: $src"; return 1; }
-    check_cmd tar || { _err "缺少 tar 命令"; return 1; }
-    tar -tzf "$src" >/dev/null 2>&1 || { _err "不是有效的 tar.gz 备份"; return 1; }
+    check_dependencies false || { _err "恢复所需依赖安装失败"; return 1; }
+    local backup_size max_backup_size="${VLESS_MAX_BACKUP_BYTES:-536870912}"
+    backup_size=$(stat -c%s "$src" 2>/dev/null || echo 0)
+    [[ "$max_backup_size" =~ ^[0-9]+$ ]] || { _err "VLESS_MAX_BACKUP_BYTES 必须是整数"; return 1; }
+    (( backup_size > 0 && backup_size <= max_backup_size )) || {
+        _err "备份大小异常或超过上限 (${max_backup_size} bytes)"
+        return 1
+    }
+    local restore_sha; restore_sha=$(_sha256_file "$src")
+    _info "备份 SHA-256: ${restore_sha}"
+    if [[ -n "${VLESS_RESTORE_SHA256:-}" ]] && ! _verify_sha256 "$src" "$VLESS_RESTORE_SHA256"; then
+        _err "备份与 VLESS_RESTORE_SHA256 不匹配，已拒绝恢复"
+        return 1
+    fi
+    _restore_archive_safe "$src" || { _err "备份包结构或文件类型不安全，已拒绝恢复"; return 1; }
+    local entry_count; entry_count=$(tar -tzf "$src" 2>/dev/null | wc -l)
+    (( entry_count <= 20000 )) || { _err "备份条目过多，已拒绝恢复"; return 1; }
 
     local -A avail_map=()
     local tmp; tmp=$(mktemp -d) || return 1
-    tar -xzf "$src" -C "$tmp" 2>/dev/null || { rm -rf "$tmp"; _err "解包失败"; return 1; }
+    ( ulimit -f $((max_backup_size / 512)); tar -xzf "$src" -C "$tmp" 2>/dev/null ) || {
+        rm -rf "$tmp"; _err "解包失败或单个文件超过大小上限"; return 1; }
+    _tree_safe "$tmp" || { rm -rf "$tmp"; _err "备份解包后包含链接或特殊文件"; return 1; }
+    local expanded_kb; expanded_kb=$(du -sk "$tmp" 2>/dev/null | awk '{print $1}')
+    (( ${expanded_kb:-0} <= max_backup_size / 1024 )) || {
+        rm -rf "$tmp"; _err "备份解包后超过允许大小，已终止恢复"; return 1; }
     if [[ ! -f "$tmp/etc/db.json" ]]; then
         rm -rf "$tmp"; _err "备份包中缺少 etc/db.json，无法恢复"; return 1
     fi
@@ -9961,23 +10130,82 @@ do_restore() {
         _line
     fi
 
-    if [[ -f "$DB_FILE" ]]; then
+    if [[ -e "$CFG" && ! -d "$CFG" ]]; then
+        rm -rf "$tmp"; _err "$CFG 不是目录，无法安全恢复"; return 1
+    fi
+    if [[ -d "$CFG" ]]; then
         _warn "当前服务器已有配置，恢复会覆盖 db.json / 证书 / WARP / 订阅 UUID"
-        _ask_yes "确认继续?" || { rm -rf "$tmp"; _info "已取消"; return 0; }
-        cp -a "$DB_FILE" "${DB_FILE}.before-restore.bak" 2>/dev/null &&             _info "原 db.json 已备份为 ${DB_FILE}.before-restore.bak"
+    fi
+    if [[ -z "${VLESS_RESTORE_SHA256:-}" ]]; then
+        _warn "未提供外部可信的备份哈希；备份中的 acme.sh 状态可能包含可执行脚本"
+        _ask_yes "确认信任该备份并继续?" || { rm -rf "$tmp"; _info "已取消"; return 0; }
+    elif [[ -d "$CFG" ]]; then
+        _ask_yes "哈希已验证，确认覆盖当前配置?" || { rm -rf "$tmp"; _info "已取消"; return 0; }
+    fi
+    if [[ -d "$CFG" ]]; then
         stop_services
     fi
 
-    mkdir -p "$CFG"; chmod 711 "$CFG" 2>/dev/null
-    cp -a "$tmp/etc/." "$CFG/" || { rm -rf "$tmp"; _err "写入 $CFG 失败"; return 1; }
+    # 先在同一文件系统中完整暂存，再用目录重命名切换，避免覆盖式复制留下旧文件。
+    local restore_stamp cfg_stage cfg_previous="" acme_stage="" acme_previous=""
+    restore_stamp="$(date '+%Y%m%d-%H%M%S')-$$"
+    cfg_stage=$(mktemp -d "${CFG}.restore.XXXXXX") || { rm -rf "$tmp"; return 1; }
+    cp -a "$tmp/etc/." "$cfg_stage/" || {
+        rm -rf "$tmp" "$cfg_stage"; _err "暂存恢复配置失败"; return 1; }
+    _tree_safe "$cfg_stage" || {
+        rm -rf "$tmp" "$cfg_stage"; _err "暂存配置包含不安全文件"; return 1; }
+    chown -R root:root "$cfg_stage" 2>/dev/null || {
+        rm -rf "$tmp" "$cfg_stage"; _err "无法修正恢复配置所有者"; return 1; }
+    find "$cfg_stage" -type d -exec chmod 700 {} + 2>/dev/null
+    find "$cfg_stage" -type f -exec chmod 600 {} + 2>/dev/null
+
+    if [[ -d "$tmp/acme" ]]; then
+        acme_stage=$(mktemp -d "$HOME/.acme.sh.restore.XXXXXX") || {
+            rm -rf "$tmp" "$cfg_stage"; return 1; }
+        cp -a "$tmp/acme/." "$acme_stage/" || {
+            rm -rf "$tmp" "$cfg_stage" "$acme_stage"; _err "暂存 acme.sh 状态失败"; return 1; }
+        _tree_safe "$acme_stage" || {
+            rm -rf "$tmp" "$cfg_stage" "$acme_stage"; _err "acme.sh 状态包含不安全文件"; return 1; }
+        chown -R root:root "$acme_stage" 2>/dev/null || {
+            rm -rf "$tmp" "$cfg_stage" "$acme_stage"; _err "无法修正 acme.sh 状态所有者"; return 1; }
+        chmod -R go-w "$acme_stage" 2>/dev/null
+    fi
+
+    if [[ -d "$CFG" ]]; then
+        cfg_previous="${CFG}.before-restore-${restore_stamp}"
+        mv "$CFG" "$cfg_previous" || {
+            rm -rf "$tmp" "$cfg_stage" ${acme_stage:+"$acme_stage"}; _err "备份现有配置目录失败"; return 1; }
+    fi
+    if ! mv "$cfg_stage" "$CFG"; then
+        [[ -n "$cfg_previous" ]] && mv "$cfg_previous" "$CFG" 2>/dev/null
+        rm -rf "$tmp" ${acme_stage:+"$acme_stage"}; _err "切换恢复配置失败，已回滚"; return 1
+    fi
+
+    if [[ -n "$acme_stage" ]]; then
+        if [[ -d "$HOME/.acme.sh" ]]; then
+            acme_previous="$HOME/.acme.sh.before-restore-${restore_stamp}"
+            if ! mv "$HOME/.acme.sh" "$acme_previous"; then
+                mv "$CFG" "${CFG}.failed-restore-${restore_stamp}" 2>/dev/null
+                [[ -n "$cfg_previous" ]] && mv "$cfg_previous" "$CFG" 2>/dev/null
+                rm -rf "$tmp" "$acme_stage"; _err "备份现有 acme.sh 状态失败，配置已回滚"; return 1
+            fi
+        fi
+        if ! mv "$acme_stage" "$HOME/.acme.sh"; then
+            [[ -n "$acme_previous" ]] && mv "$acme_previous" "$HOME/.acme.sh" 2>/dev/null
+            mv "$CFG" "${CFG}.failed-restore-${restore_stamp}" 2>/dev/null
+            [[ -n "$cfg_previous" ]] && mv "$cfg_previous" "$CFG" 2>/dev/null
+            rm -rf "$tmp"; _err "切换 acme.sh 状态失败，配置已回滚"; return 1
+        fi
+        _info "已恢复 acme.sh 账户与证书状态"
+    fi
+
+    chmod 711 "$CFG" 2>/dev/null
     chmod 600 "$DB_FILE" 2>/dev/null
     [[ -d "$SSL_DIR" ]] && chmod 700 "$SSL_DIR" 2>/dev/null
-    if [[ -d "$tmp/acme" ]]; then
-        mkdir -p "$HOME/.acme.sh"
-        cp -a "$tmp/acme/." "$HOME/.acme.sh/" 2>/dev/null && _info "已恢复 acme.sh 账户与证书状态"
-    fi
     rm -rf "$tmp"
     _ok "配置文件已恢复"
+    [[ -n "$cfg_previous" ]] && _info "原配置已保留: $cfg_previous"
+    [[ -n "$acme_previous" ]] && _info "原 acme.sh 状态已保留: $acme_previous"
 
     db_migrate_legacy
 
