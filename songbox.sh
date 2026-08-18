@@ -9,7 +9,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
 fi
 
 #═══════════════════════════════════════════════════════════════════════════════
-#  SingBox 万能工具箱 v0.0.4 [Sing-box 统一内核]
+#  SingBox 万能工具箱 v0.0.5 [Sing-box 统一内核]
 #
 #  架构:
 #    • Sing-box 内核: 承载除 Snell 外的全部协议（TCP/TLS/QUIC 统一管理）
@@ -25,7 +25,7 @@ fi
 #  适配: Alpine / Debian / Ubuntu / CentOS
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="0.0.4"
+readonly VERSION="0.0.5"
 readonly AUTHOR="NeverF1ower"
 readonly SCRIPT_NAME="SingBox 万能工具箱"
 
@@ -912,36 +912,87 @@ db_del_balancer_group() {
 #   裸域名                    -> domain_suffix
 #   IP / CIDR                -> ip_cidr
 declare -A ROUTING_PRESETS=(
+    #── AI 服务 ────────────────────────────────────────────────────────────────
     [openai]="geosite-openai,openai.com,chatgpt.com,chat.openai.com,ai.com,sora.com,oaistatic.com,oaiusercontent.com"
     [claude]="geosite-anthropic,claude.com,claude.ai,anthropic.com,cdn.usefathom.com"
-    [stream]="geosite-netflix,geosite-disney"
+    #── 流媒体 / 短视频 / Google ───────────────────────────────────────────────
+    # Netflix 自有 AS2906/AS40027 网段，用于客户端直接以 IP 发起连接的场景
+    [netflix]="geosite-netflix,netflix.com,netflix.net,nflxext.com,nflximg.net,nflxso.net,nflxvideo.net,fast.com,23.246.0.0/18,37.77.184.0/21,45.57.0.0/17,64.120.128.0/17,66.197.128.0/17,108.175.32.0/20,185.2.220.0/22,185.9.188.0/22,192.173.64.0/18,198.38.96.0/19,198.45.48.0/20,207.45.72.0/22,208.75.76.0/22,2a00:86c0::/32,2607:fb10::/32,2620:10c:7000::/44"
+    # bamgrid.com / disneystreaming.com 是 Disney 流媒体后端，ESPN+ 亦复用
+    [disney]="geosite-disney,disneyplus.com,disney-plus.net,disneystreaming.com,dssott.com,bamgrid.com,starott.com,star-plus.net,cdn.registerdisney.go.com"
     [tiktok]="geosite-tiktok,lf16-effectcdn.byteeffecttos-g.com,lf16-pkgcdn.pitaya-clientai.com,p16-tiktokcdn-com.akamaized.net,trae-api-sg.mchost.guru,bytedapm.com,bytegecko-i18n.com,byteintlapi.com,byteoversea.com,capcut.com,ibytedtos.com,ibyteimg.com,ipstatp.com,isnssdk.com,marscode.com,muscdn.com,musical.ly,sgpstatp.com,snssdk.com,tik-tokapi.com,tiktok.com,tiktokcdn-us.com,tiktokcdn.com,tiktokd.net,tiktokd.org,tiktokmusic.app,tiktokv.com,tiktokv.us,trae.ai,ttwebview.com"
-    [google]="geosite-youtube,geosite-google,geosite-google-gemini,gemini.google.com,aistudio.google.com,generativelanguage.googleapis.com,deepmind.google"
-    [telegram]="geosite-telegram,91.108.4.0/22,91.108.8.0/22,91.108.12.0/22,91.108.16.0/22,91.108.20.0/22,91.108.56.0/22,91.105.192.0/23,149.154.160.0/20,185.76.151.0/24,2001:67c:4e8::/48,2001:b28:f23c::/48,2001:b28:f23d::/48,2001:b28:f23f::/48,2a0a:f280::/32"
-    [github]="geosite-github"
+    [google]="geosite-youtube,geosite-google,geosite-google-gemini,geosite-google-deepmind,gemini.google.com,aistudio.google.com,notebooklm.google.com,generativelanguage.googleapis.com,deepmind.google"
+    #── 社交 / 开发 ────────────────────────────────────────────────────────────
+    [telegram]="geosite-telegram,91.108.4.0/22,91.108.8.0/22,91.108.12.0/22,91.108.16.0/22,91.108.20.0/22,91.108.56.0/22,91.105.192.0/23,95.161.64.0/20,149.154.160.0/20,185.76.151.0/24,2001:67c:4e8::/48,2001:b28:f23c::/48,2001:b28:f23d::/48,2001:b28:f23f::/48,2a0a:f280::/32"
+    [github]="geosite-github,geosite-github-copilot,github.com,githubusercontent.com,githubassets.com,githubcopilot.com,github.io,github.dev,ghcr.io,githubapp.com,githubnext.com"
+    #── 交易所 / 支付 ──────────────────────────────────────────────────────────
     [exchange]="geosite-binance,geosite-okx,okx.com,okex.com,okexcn.com,oklink.com,coinall.com,binance.com,bnbstatic.com,binancefuture.com,binance.vision,binance.info"
     [bybit]="geosite-bybit,bybit.com,bybit-exchange.com,bybitglobal.com,bycsi.com"
+    # 尼日利亚钱包 + 尼日利亚 IP（geoip-ng 会覆盖所有 NG 归属地址）
+    [ngwallet]="geoip-ng,gomoney.global,mypaga.com,paga.com,usetimon.com"
+    #── 美区 / 英区流媒体 ──────────────────────────────────────────────────────
+    [hulu]="geosite-hulu,hulu.com,hulustream.com,huluim.com,prod.hjholdings.tv"
+    [espn]="geosite-espn,espn.com,watchespn.com,espncdn.com,espn.go.com,espnplayer.com"
+    [paramount]="paramountplus.com,pplusstatic.com,cbs.com,cbsaavideo.com,cbsivideo.com,cbsi.com,cbsnews.com,cbsig.net,cbsi.live.ott.irdeto.com,cbsplaylistserver.aws.syncbak.com,cbsservice.aws.syncbak.com,link.theplatform.com"
+    # go.com 同时覆盖 abc.go.com / espn.go.com / disney.go.com
+    [abcgo]="geosite-abc,abc.com,abc.go.com,go.com,edgedatg.com,abcotvs.com"
+    [prime]="geosite-primevideo,primevideo.com,amazonvideo.com,aiv-cdn.net,aiv-delivery.net,pv-cdn.net,atv-ps.amazon.com,atv-ext.amazon.com,media-amazon.com,fls-na.amazon.com,avodmp4s3ww-a.akamaihd.net"
+    [peacock]="peacocktv.com,nbc.com,nbcuni.com,nbcuniversal.com"
+    [mgm]="mgmplus.com,epix.com,epixhd.com"
+    [discovery]="geosite-discoveryplus,discoveryplus.com,discoveryplus.co.uk,discoveryplus.in,disco-api.com,dnitv.com,discovery.com"
+    [bbc]="geosite-bbc,bbc.co.uk,bbci.co.uk,bbc.com,bbcverticals.com,open.live.bbc.co.uk,bbctvapps.co.uk,bbcfmt.hs.llnwd.net"
+    #── 地区规则 ───────────────────────────────────────────────────────────────
+    # .jp 覆盖 co.jp / ne.jp / or.jp / go.jp 等全部日本域名；如需连同日本 IP，
+    # 在本行追加 geoip-jp（注意可能连带命中托管在日本的非日本业务）
+    [jp]="geosite-abema,geosite-niconico,geosite-tver,geosite-nhk,geosite-unext,geosite-dmm,geosite-pixiv,geosite-dlsite,geosite-category-bank-jp,.jp,abema.tv,abema.io,dmm.com,dlsite.com,pixiv.net"
     [cn]="geosite-cn,geoip-cn"
-    [ipcheck]="checkip.amazonaws.com,icanhazip.com,ifconfig.me,ipapi.co,ipinfo.io,ip.sb,whoami.cloudflare,bgp.he.net,ident.me,ipify.org,ippure.com,ifconfig.co,iconify.design,ipconfig.io"
+    #── 工具 ───────────────────────────────────────────────────────────────────
+    [ipcheck]="checkip.amazonaws.com,icanhazip.com,ifconfig.me,ipapi.co,ipinfo.io,ip.sb,whoami.cloudflare,bgp.he.net,ident.me,ipify.org,ippure.com,ifconfig.co,ip-api.com,ipconfig.io"
+    #── 特殊：不出现在菜单，仅供 b) 广告屏蔽与旧规则回显使用 ───────────────────
     [ads]="geosite-category-ads-all"
+    [stream]="geosite-netflix,geosite-disney"
 )
 declare -A ROUTING_PRESET_NAMES=(
     [openai]="OpenAI / ChatGPT"
     [claude]="Anthropic / Claude"
-    [stream]="Netflix + Disney+"
+    [netflix]="Netflix"
+    [disney]="Disney+"
     [tiktok]="TikTok"
     [google]="YouTube + Gemini + Google"
     [telegram]="Telegram"
     [github]="GitHub"
     [exchange]="OKX + Binance (非 EEA/EU)"
     [bybit]="Bybit"
+    [ngwallet]="Gomoney + Paga + Timon (尼日利亚)"
+    [hulu]="Hulu"
+    [espn]="ESPN Plus"
+    [paramount]="Paramount Plus"
+    [abcgo]="ABC Go"
+    [prime]="Amazon Prime Video"
+    [peacock]="Peacock"
+    [mgm]="MGM Plus"
+    [discovery]="Discovery Plus"
+    [bbc]="BBC iPlayer UK"
+    [jp]="日本网站"
     [cn]="中国大陆(CN)"
     [ipcheck]="IP 检测站点"
     [ads]="广告屏蔽"
+    [stream]="Netflix + Disney+ (旧)"
 )
 
-# 菜单里的展示顺序
-readonly ROUTING_PRESET_ORDER=(openai claude stream tiktok google telegram github exchange bybit cn ipcheck)
+# 菜单里的展示顺序（编号即用户输入的序号）
+readonly ROUTING_PRESET_ORDER=(openai claude netflix disney tiktok google telegram github exchange bybit ngwallet hulu espn paramount abcgo prime peacock mgm discovery bbc jp cn ipcheck)
+
+# 菜单分组标题：key 出现时先打印一行分组名
+declare -A ROUTING_PRESET_GROUP=(
+    [openai]="AI 服务"
+    [netflix]="流媒体 / 短视频 / Google"
+    [telegram]="社交 / 开发"
+    [exchange]="交易所 / 支付"
+    [hulu]="美区 / 英区流媒体"
+    [jp]="地区规则"
+    [ipcheck]="工具"
+)
 
 db_routing_rules() { _db_q '.routing_rules // []'; }
 db_has_routing_rule() {
@@ -6538,6 +6589,9 @@ routing_add_rule() {
     local i=1 key
     declare -A menu_map=()
     for key in "${ROUTING_PRESET_ORDER[@]}"; do
+        # 分组标题，仅用于视觉分隔，不占用编号
+        [[ -n "${ROUTING_PRESET_GROUP[$key]:-}" ]] &&
+            echo -e "  ${D}── ${ROUTING_PRESET_GROUP[$key]} ──${NC}" >&2
         local extra=""
         # 括号里标注该预设用到的规则集与补充条目数量，便于判断覆盖面
         local rs_cnt dm_cnt
@@ -6551,10 +6605,12 @@ routing_add_rule() {
             extra=" ${D}(${dm_cnt} 条自定义，无规则集)${NC}"
         fi
         [[ "$key" == "exchange" ]] && extra=" ${D}(${rs_cnt} 个规则集 + ${dm_cnt} 条补充，不含 .eu)${NC}"
+        [[ "$key" == "ngwallet" ]] && extra=" ${D}(${rs_cnt} 个规则集 + ${dm_cnt} 条补充，含 NG 全域 IP)${NC}"
         _item "$i" "${ROUTING_PRESET_NAMES[$key]}${extra}"
         menu_map[$i]="$key"
         ((i++))
     done
+    _line
     _item "c" "自定义域名 / IP / geosite / geoip"
     _item "b" "广告屏蔽 (geosite-category-ads-all)"
     _item "a" "所有流量"
